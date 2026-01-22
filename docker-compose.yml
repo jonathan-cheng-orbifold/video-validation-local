@@ -1,0 +1,14 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist temp files if needed (optional)
+      - ./backend/storage:/app/storage
+
+      # Mount credentials.csv as a read-only secret
+      - "/Users/jonathancheng/Downloads/ego-exo-upload/credentials.csv:/run/secrets/wasabi_credentials.csv:ro"
+
