@@ -393,30 +393,7 @@ async def upload_video(
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to buffer upload: {e}")
 
-    # 2) Upload video to Wasabi with initial metadata
-    try:
-        with open(tmp_path, "rb") as f:
-            s3.put_object(
-                Bucket=WASABI_BUCKET,
-                Key=video_key,
-                Body=f,
-                ContentType=file.content_type or "application/octet-stream",
-                Metadata={
-                    "upload_id": upload_id,
-                    "filename": original_name,
-                    "folder": folder_prefix,
-                    "status": "processing",
-                    "record_key": record_key,
-                },
-            )
-    except (BotoCoreError, ClientError) as e:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"Failed to upload to Wasabi: {e}")
-
-    # 3) Validate immediately
+    # 2) Validate first (on the local temp file)
     try:
         validation = validate_video_file(
             tmp_path,
@@ -439,17 +416,53 @@ async def upload_video(
             "video_path": tmp_path,
             "created_at": utc_now_iso(),
         }
+
+    passed = bool(validation.get("passed", False))
+    status = "good" if passed else "bad"
+    validated_at = utc_now_iso()
+
+    # 3) Upload to Wasabi ONCE with final metadata (no copy_object)
+    try:
+        from boto3.s3.transfer import TransferConfig  # type: ignore
+
+        transfer_cfg = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,      # 8MB
+            multipart_chunksize=64 * 1024 * 1024,     # 64MB parts
+            max_concurrency=4,
+            use_threads=True,
+        )
+
+        extra_args = {
+            "ContentType": file.content_type or "application/octet-stream",
+            "Metadata": {
+                "upload_id": upload_id,
+                "filename": original_name,
+                "folder": folder_prefix,
+                "status": status,
+                "passed": "true" if passed else "false",
+                "validated_at": validated_at,
+                "record_key": record_key,
+            },
+        }
+        
+        # multipart + retries for large files
+        s3.upload_file(
+            Filename=tmp_path,
+            Bucket=WASABI_BUCKET,
+            Key=video_key,
+            ExtraArgs=extra_args,
+            Config=transfer_cfg,
+        )
+
+    except (BotoCoreError, ClientError) as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to Wasabi: {e}")
     finally:
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
 
-    passed = bool(validation.get("passed", False))
-    status = "good" if passed else "bad"
-    validated_at = utc_now_iso()
-
-    # 4) Write a single record object (mapping + full details)
+    # 4) Write record JSON after upload
     record = {
         "upload_id": upload_id,
         "bucket": WASABI_BUCKET,
@@ -476,30 +489,6 @@ async def upload_video(
     except (BotoCoreError, ClientError) as e:
         raise HTTPException(status_code=500, detail=f"Failed to write record: {e}")
 
-    # 5) Update video metadata to final status (requires copy_object)
-    try:
-        head = s3.head_object(Bucket=WASABI_BUCKET, Key=video_key)
-        content_type = head.get("ContentType") or (file.content_type or "application/octet-stream")
-
-        s3.copy_object(
-            Bucket=WASABI_BUCKET,
-            Key=video_key,
-            CopySource={"Bucket": WASABI_BUCKET, "Key": video_key},
-            ContentType=content_type,
-            MetadataDirective="REPLACE",
-            Metadata={
-                "upload_id": upload_id,
-                "filename": original_name,
-                "folder": folder_prefix,
-                "status": status,
-                "passed": "true" if passed else "false",
-                "validated_at": validated_at,
-                "record_key": record_key,
-            },
-        )
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(status_code=500, detail=f"Failed to set Wasabi metadata: {e}")
-
     return {
         "upload_id": upload_id,
         "filename": original_name,
@@ -515,7 +504,6 @@ async def upload_video(
         "stats": record["validator"]["stats"],
         "message": record["validator"]["message"],
     }
-
 
 # ------------------------------------------------------------
 # Status
