@@ -56,13 +56,47 @@ export async function uploadVideo(file, folder, { onProgress } = {}) {
 
     xhr.onerror = () => reject(new Error("Network error"));
 
+    // -------- Upload progress + speed (bytes/sec) --------
     if (xhr.upload && onProgress) {
+      let lastTime = performance.now();
+      let lastLoaded = 0;
+
+      // Exponential moving average for smoother speed
+      let smoothedBps = 0;
+      const alpha = 0.2;
+
       xhr.upload.onprogress = (evt) => {
-        if (evt.lengthComputable) {
-          onProgress(Math.round((evt.loaded / evt.total) * 100));
+        const total =
+          evt.total && evt.total > 0
+            ? evt.total
+            : file?.size || 0;
+
+        const loaded = evt.loaded || 0;
+
+        const percent =
+          total > 0
+            ? Math.min(100, Math.round((loaded / total) * 100))
+            : 0;
+
+        const now = performance.now();
+        const dt = (now - lastTime) / 1000;
+        const dBytes = loaded - lastLoaded;
+
+        if (dt >= 0.15 && dBytes >= 0) {
+          const instBps = dBytes / dt;
+          smoothedBps =
+            smoothedBps === 0
+              ? instBps
+              : alpha * instBps + (1 - alpha) * smoothedBps;
+
+          lastTime = now;
+          lastLoaded = loaded;
         }
+
+        onProgress({ percent, bps: smoothedBps });
       };
     }
+    // ----------------------------------------------------
 
     const form = new FormData();
     form.append("file", file);

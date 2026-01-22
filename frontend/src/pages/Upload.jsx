@@ -4,11 +4,28 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { uploadVideo } from "../api";
 
+function formatBytesPerSec(bps) {
+  if (!Number.isFinite(bps) || bps <= 0) return "—";
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+  let i = 0;
+  let v = bps;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
 export default function Upload() {
   const [file, setFile] = useState(null);
   const [folder, setFolder] = useState("");
   const [progress, setProgress] = useState(0);
+  const [uploadSpeedBps, setUploadSpeedBps] = useState(0);
   const [busy, setBusy] = useState(false);
+  const phase =
+    busy && progress >= 100 ? "validating" :
+    busy ? "uploading" :
+    "idle";
   const [error, setError] = useState("");
 
   const navigate = useNavigate();
@@ -29,10 +46,14 @@ export default function Upload() {
 
     setBusy(true);
     setProgress(0);
+    setUploadSpeedBps(0);
 
     try {
       const resp = await uploadVideo(file, folder, {
-        onProgress: (p) => setProgress(p),
+        onProgress: ({ percent, bps }) => {
+          setProgress(percent);
+          setUploadSpeedBps(bps);
+        },
       });
 
       navigate(`/status/${resp.upload_id}`);
@@ -91,12 +112,30 @@ export default function Upload() {
 
         {/* Progress */}
         {busy && (
-          <div className="progress">
-            <div
-              className="progress-bar"
-              style={{ width: `${progress}%` }}
-            />
-            <div className="progress-label">{progress}%</div>
+          <div>
+            <div className="progress">
+              <div
+                className="progress-bar"
+                style={{
+                  width: phase === "validating" ? "100%" : `${progress}%`,
+                  opacity: phase === "validating" ? 0.6 : 1,
+                }}
+              />
+            </div>
+
+            <div className="progress-label">
+              {phase === "uploading" && (
+                <>
+                  Uploading… {progress}% • {formatBytesPerSec(uploadSpeedBps)}
+                </>
+              )}
+
+              {phase === "validating" && (
+                <>
+                  Upload complete — validating video…
+                </>
+              )}
+            </div>
           </div>
         )}
 
@@ -104,7 +143,9 @@ export default function Upload() {
         {error && <div className="alert">{error}</div>}
 
         <button className="btn" type="submit" disabled={!file || busy}>
-          {busy ? "Uploading..." : "Upload & Validate"}
+          {phase === "uploading" && "Uploading..."}
+          {phase === "validating" && "Validating..."}
+          {phase === "idle" && "Upload & Validate"}
         </button>
       </form>
     </div>
