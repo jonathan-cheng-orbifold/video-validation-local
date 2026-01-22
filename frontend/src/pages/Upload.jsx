@@ -74,7 +74,6 @@ export default function Upload() {
           <label className="label">Video File</label>
           <input
             type="file"
-            accept="video/mp4,video/quicktime,video/*"
             onChange={(e) => setFile(e.target.files?.[0] || null)}
             disabled={busy}
           />
