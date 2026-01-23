@@ -60,8 +60,6 @@ AUTH_COOKIE_NAME = os.environ.get("AUTH_COOKIE_NAME", "egoexo_auth")
 AUTH_TTL_SECONDS = int(os.environ.get("AUTH_TTL_SECONDS", "43200"))  # 12h default
 
 # Cookie flags (tune for production)
-# - In local http:// dev you usually need SECURE=False
-# - In production https:// you should set SECURE=True
 AUTH_COOKIE_SECURE = os.environ.get("AUTH_COOKIE_SECURE", "false").lower() == "true"
 AUTH_COOKIE_SAMESITE = os.environ.get("AUTH_COOKIE_SAMESITE", "lax").lower()  # "lax" or "none"
 AUTH_COOKIE_PATH = "/"
@@ -77,7 +75,6 @@ ALLOWED_ORIGINS = [
 # Key layout
 UPLOADS_PREFIX = "uploads"
 RECORDS_PREFIX = "records"  # single auxiliary object per upload_id
-
 
 # ------------------------------------------------------------
 # Helpers
@@ -172,17 +169,12 @@ def _b64url_decode(s: str) -> bytes:
 
 def _sign(data: bytes) -> str:
     if not AUTH_SECRET:
-        # fail fast if misconfigured
         raise RuntimeError("AUTH_SECRET is not set")
     mac = hmac.new(AUTH_SECRET.encode("utf-8"), data, hashlib.sha256).digest()
     return _b64url_encode(mac)
 
 
 def make_auth_token() -> str:
-    """
-    Token format: <payload_b64>.<sig_b64>
-    payload JSON: {"exp": <unix seconds>}
-    """
     exp = int(time.time()) + AUTH_TTL_SECONDS
     payload = json.dumps({"exp": exp}, separators=(",", ":")).encode("utf-8")
     payload_b64 = _b64url_encode(payload)
@@ -214,19 +206,17 @@ def is_request_authed(request: Request) -> bool:
 # Init clients and app
 # ------------------------------------------------------------
 
-# Fail fast if auth not configured
 if not AUTH_SECRET:
     raise RuntimeError("AUTH_SECRET env var is required (shared passcode).")
 
-# Init S3 client once
 s3 = make_s3_client()
 
-app = FastAPI(title="Ego/Exo Video Validation API", version="0.4.0")
+app = FastAPI(title="Ego/Exo Video Validation API", version="0.5.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,  # REQUIRED for cookies cross-origin
+    allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -244,15 +234,12 @@ AUTH_EXEMPT_PATHS = {
 
 @app.middleware("http")
 async def require_auth_middleware(request: Request, call_next):
-    # Let CORS preflight through
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Exempt auth endpoints + health
     if request.url.path in AUTH_EXEMPT_PATHS:
         return await call_next(request)
 
-    # Everything else requires auth
     if not is_request_authed(request):
         return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
 
@@ -278,9 +265,6 @@ class LoginRequest(BaseModel):
 
 @app.post("/auth/login")
 def login(req: LoginRequest):
-    """
-    If secretKey matches AUTH_SECRET, set HttpOnly cookie.
-    """
     if not req.secretKey or req.secretKey != AUTH_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret key")
 
@@ -292,7 +276,7 @@ def login(req: LoginRequest):
         value=token,
         httponly=True,
         secure=AUTH_COOKIE_SECURE,
-        samesite=AUTH_COOKIE_SAMESITE,  # "lax" (local) or "none" (cross-site if needed)
+        samesite=AUTH_COOKIE_SAMESITE,
         path=AUTH_COOKIE_PATH,
         max_age=AUTH_TTL_SECONDS,
     )
@@ -301,9 +285,6 @@ def login(req: LoginRequest):
 
 @app.post("/auth/logout")
 def logout():
-    """
-    Clear auth cookie.
-    """
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(
         key=AUTH_COOKIE_NAME,
@@ -314,14 +295,11 @@ def logout():
 
 @app.get("/auth/me")
 def me(request: Request):
-    """
-    Used by frontend route guard to determine if authenticated.
-    """
     return {"authed": is_request_authed(request)}
 
 
 # ------------------------------------------------------------
-# Folder creation
+# Folder creation (optional; mostly for UI)
 # ------------------------------------------------------------
 
 class CreateFolderRequest(BaseModel):
@@ -371,7 +349,8 @@ async def upload_video(
     folder_prefix = safe_prefix(folder).rstrip("/")
     uploads_base = f"{UPLOADS_PREFIX}/{folder_prefix}" if folder_prefix else UPLOADS_PREFIX
 
-    video_key = f"{uploads_base}/{upload_id}_{original_name}"
+    # Preserve structure: uploads/<folder>/<filename>
+    video_key = f"{uploads_base}/{original_name}"
     record_key = f"{RECORDS_PREFIX}/{upload_id}.json"
 
     # 1) Buffer upload into a temp file for OpenCV
@@ -393,7 +372,7 @@ async def upload_video(
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to buffer upload: {e}")
 
-    # 2) Validate first (on the local temp file)
+    # 2) Validate first (on local temp file)
     try:
         validation = validate_video_file(
             tmp_path,
@@ -421,7 +400,7 @@ async def upload_video(
     status = "good" if passed else "bad"
     validated_at = utc_now_iso()
 
-    # 3) Upload to Wasabi ONCE with final metadata (no copy_object)
+    # 3) Upload to Wasabi ONCE with final metadata (multipart for big files)
     try:
         from boto3.s3.transfer import TransferConfig  # type: ignore
 
@@ -444,8 +423,7 @@ async def upload_video(
                 "record_key": record_key,
             },
         }
-        
-        # multipart + retries for large files
+
         s3.upload_file(
             Filename=tmp_path,
             Bucket=WASABI_BUCKET,
@@ -462,7 +440,7 @@ async def upload_video(
         except Exception:
             pass
 
-    # 4) Write record JSON after upload
+    # 4) Write record JSON (authoritative details)
     record = {
         "upload_id": upload_id,
         "bucket": WASABI_BUCKET,
@@ -505,6 +483,7 @@ async def upload_video(
         "message": record["validator"]["message"],
     }
 
+
 # ------------------------------------------------------------
 # Status
 # ------------------------------------------------------------
@@ -513,7 +492,6 @@ async def upload_video(
 def get_status(upload_id: str) -> Dict[str, Any]:
     record_key = f"{RECORDS_PREFIX}/{upload_id}.json"
 
-    # 1) record is the authoritative mapping + details
     try:
         record = s3_get_json(WASABI_BUCKET, record_key)
     except ClientError as e:
@@ -528,7 +506,6 @@ def get_status(upload_id: str) -> Dict[str, Any]:
     if not video_key:
         raise HTTPException(status_code=500, detail="Corrupt record: missing object_key")
 
-    # 2) read video metadata (to keep status in object metadata true)
     meta: Dict[str, str] = {}
     try:
         head = s3.head_object(Bucket=WASABI_BUCKET, Key=video_key)
